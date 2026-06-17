@@ -29,6 +29,9 @@ mail or background apps alive while still receiving notifications.
 - **rofi-friendly** — `list-tray`, `tray-activate`, `tray-close` and `resolve` keep all
   the D-Bus and icon logic inside the binary, so a rofi tray menu can be a tiny reader
   script (no `gdbus` or icon cache in bash).
+- **Built-in tray watcher** — `hyprland-minimizer watch` runs a standalone
+  `org.kde.StatusNotifierWatcher`, so you can drop your bar's tray module entirely and
+  still have a fully working tray (apps register here; browse it via rofi).
 - **Lightweight** — one small daemon per minimized window, no config files.
 
 ## Build from source
@@ -49,6 +52,7 @@ hyprland-minimizer resolve <class> <pid>          Print "name|icon" resolved for
 hyprland-minimizer list-tray                      Print "name|icon|bus|path|pid" per tray item
 hyprland-minimizer tray-activate <bus> <path>     Activate (open) a tray item
 hyprland-minimizer tray-close <bus> <path> <pid>  Close a tray item (smart, see below)
+hyprland-minimizer watch                          Run a StatusNotifierWatcher daemon
 ```
 
 Minimize a specific window (get the address from `hyprctl clients`):
@@ -104,6 +108,22 @@ Flameshot|org.flameshot.Flameshot|:1.293|/StatusNotifierItem|8433
 `tray-close` is smart: for windows minimized by this tool it closes the actual
 window; for any other tray app it terminates the process.
 
+## Standalone tray watcher (no bar tray module)
+
+A system tray needs a *watcher* (`org.kde.StatusNotifierWatcher`) for apps to register
+their icons. Normally that's your bar's tray module (Waybar's `tray`). If you'd rather
+not run a bar tray module at all, `hyprland-minimizer` can be the watcher itself:
+
+```
+hl.exec_cmd("hyprland-minimizer watch")   -- run at Hyprland startup
+```
+
+Then remove the tray module from your bar. Apps (Discord, qBittorrent, ...) and your
+minimized windows register with this watcher, and you browse them via rofi (`list-tray`).
+It reports `IsStatusNotifierHostRegistered = true` so Qt/Electron apps publish their
+icons, and drops items whose process leaves the bus. Only one watcher can own the name,
+so don't run it alongside a bar tray module.
+
 ## How it works
 
 Minimizing moves the window to the `special:minimized` workspace and starts a small
@@ -115,7 +135,8 @@ being restored or closed externally and exits on its own.
 ## Requirements
 
 - **Hyprland 0.55+** (Lua dispatch API)
-- A **StatusNotifier tray host / watcher** (e.g. Waybar's `tray` module)
+- A **StatusNotifier watcher** — either your bar's `tray` module (e.g. Waybar) or the
+  built-in `hyprland-minimizer watch` daemon
 - A **D-Bus session bus**
 - **Rust** (to build)
 
