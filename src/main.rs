@@ -6,6 +6,7 @@ use clap::Parser;
 use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -35,6 +36,12 @@ struct WindowInfo {
     workspace: Workspace,
     title: String,
     class: String,
+    #[serde(default)]
+    pid: i32,
+    /// Resolved freedesktop icon name. Filled in after deserialization (not from
+    /// hyprctl); falls back to `class` when nothing matches.
+    #[serde(default)]
+    icon: String,
 }
 
 // --- Hyprland Interaction Functions ---
@@ -106,6 +113,265 @@ fn get_window_by_address(address: &str) -> Result<WindowInfo> {
         .into_iter()
         .find(|c| c.address == address)
         .ok_or_else(|| anyhow!("Could not find a window with address '{}'", address))
+}
+
+// --- Icon resolution ---
+// Resolves a real freedesktop icon name from a window's class (with the PID's
+// command line as a fallback), scanning .desktop files directly. This is what
+// makes generic-class apps show the right tray icon instead of a broken one
+// (e.g. themix runs as `python3 -m oomox_gui` and reports class "__main__.py",
+// which is not an icon; its real icon is "com.github.themix_project.Oomox").
+
+/// Substring of `s` up to (not including) the first non-alphanumeric character.
+fn alnum_prefix(s: &str) -> &str {
+    match s.find(|c: char| !c.is_ascii_alphanumeric()) {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// Scans .desktop files into a sorted list of (key, name, icon) tuples. Keys are
+/// the lowercased StartupWMClass and the lowercased file stem (mirrors desktop-cache.sh).
+fn desktop_entries() -> Vec<(String, String, String)> {
+    let mut dirs = vec!["/usr/share/applications".to_string()];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(format!("{}/.local/share/applications", home));
+    }
+
+    let mut entries: Vec<(String, String, String)> = Vec::new();
+    for dir in &dirs {
+        let rd = match fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for de in rd.flatten() {
+            let path = de.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let mut name = "";
+            let mut icon = "";
+            let mut wmclass = "";
+            for line in content.lines() {
+                if name.is_empty() {
+                    if let Some(v) = line.strip_prefix("Name=") {
+                        name = v;
+                    }
+                }
+                if icon.is_empty() {
+                    if let Some(v) = line.strip_prefix("Icon=") {
+                        icon = v;
+                    }
+                }
+                if wmclass.is_empty() {
+                    if let Some(v) = line.strip_prefix("StartupWMClass=") {
+                        wmclass = v;
+                    }
+                }
+            }
+            if name.is_empty() {
+                continue;
+            }
+            let name = name.to_string();
+            let icon = icon.to_string();
+            if !wmclass.is_empty() {
+                entries.push((wmclass.to_lowercase(), name.clone(), icon.clone()));
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                entries.push((stem.to_lowercase(), name, icon));
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// Resolves (name, icon) for a window from its class, with the PID's command line
+/// as a fallback (handles `python -m <module>`, electron, etc.). Returns None if
+/// nothing matches.
+fn resolve_entry(class: &str, pid: i32) -> Option<(String, String)> {
+    let entries = desktop_entries();
+
+    let exact = |q: &str| -> Option<(String, String)> {
+        entries
+            .iter()
+            .find(|(k, _, ic)| k == q && !ic.is_empty())
+            .map(|(_, n, ic)| (n.clone(), ic.clone()))
+    };
+    let prefixed = |q: &str| -> Option<(String, String)> {
+        entries
+            .iter()
+            .find(|(k, _, ic)| k.starts_with(q) && !ic.is_empty())
+            .map(|(_, n, ic)| (n.clone(), ic.clone()))
+    };
+    let suffixed = |q: &str| -> Option<(String, String)> {
+        let needle = format!(".{}", q);
+        entries
+            .iter()
+            .find(|(k, _, ic)| k.ends_with(&needle) && !ic.is_empty())
+            .map(|(_, n, ic)| (n.clone(), ic.clone()))
+    };
+
+    let key = class.to_lowercase();
+
+    // 1. exact match on the window class
+    if let Some(r) = exact(&key) {
+        return Some(r);
+    }
+    // 2. prefix of the class
+    let prefix = alnum_prefix(&key);
+    if !prefix.is_empty() {
+        if let Some(r) = prefixed(prefix) {
+            return Some(r);
+        }
+    }
+    // 3. fall back to the process command line (handles `python -m <module>`, electron, etc.)
+    if pid > 0 {
+        if let Ok(raw) = fs::read(format!("/proc/{}/cmdline", pid)) {
+            for arg in raw.split(|&b| b == 0) {
+                if arg.is_empty() {
+                    continue;
+                }
+                let arg = String::from_utf8_lossy(arg);
+                if arg.starts_with('-') {
+                    continue;
+                }
+                let base = arg.rsplit('/').next().unwrap_or(&arg).to_lowercase();
+                if base.is_empty()
+                    || base.starts_with("python")
+                    || base.starts_with("electron")
+                    || matches!(
+                        base.as_str(),
+                        "java" | "node" | "sh" | "bash" | "dash" | "env" | "perl" | "ruby"
+                    )
+                {
+                    continue;
+                }
+                if let Some(r) = exact(&base) {
+                    return Some(r);
+                }
+                let bprefix = alnum_prefix(&base);
+                if !bprefix.is_empty() {
+                    if let Some(r) = prefixed(bprefix) {
+                        return Some(r);
+                    }
+                    if let Some(r) = suffixed(bprefix) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolves just the icon name for a window, falling back to `class` if nothing matches.
+fn resolve_icon(class: &str, pid: i32) -> String {
+    resolve_entry(class, pid)
+        .map(|(_, icon)| icon)
+        .unwrap_or_else(|| class.to_string())
+}
+
+// --- System tray reading (for the rofi tray menu) ---
+// These let tray.sh be a pure reader: it calls `list-tray` to get the entries and
+// `tray-activate` to open one, instead of doing the D-Bus dance in bash.
+
+/// Uppercases the first character (mirrors bash `${var^}`).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Prints every registered StatusNotifierItem as `name|icon|bus|path|pid`.
+async fn list_tray() -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+
+    let watcher: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+        .interface("org.kde.StatusNotifierWatcher")?
+        .path("/StatusNotifierWatcher")?
+        .destination("org.kde.StatusNotifierWatcher")?
+        .build()
+        .await?;
+
+    let items: Vec<String> = watcher
+        .get_property("RegisteredStatusNotifierItems")
+        .await
+        .unwrap_or_default();
+
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+
+    for item in items {
+        let (bus, path) = match item.split_once('/') {
+            Some((b, p)) => (b.to_string(), format!("/{}", p)),
+            None => (item.clone(), "/StatusNotifierItem".to_string()),
+        };
+
+        let line: Result<()> = async {
+            let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+                .interface("org.kde.StatusNotifierItem")?
+                .destination(bus.as_str())?
+                .path(path.as_str())?
+                .build()
+                .await?;
+
+            let id: String = proxy.get_property("Id").await.unwrap_or_default();
+
+            let pid = match zbus::names::BusName::try_from(bus.as_str()) {
+                Ok(bn) => dbus.get_connection_unix_process_id(bn).await.unwrap_or(0) as i32,
+                Err(_) => 0,
+            };
+
+            let (name, icon) = resolve_entry(&id, pid)
+                .unwrap_or_else(|| (capitalize(&id), id.to_lowercase()));
+
+            println!("{}|{}|{}|{}|{}", name, icon, bus, path, pid);
+            Ok(())
+        }
+        .await;
+
+        let _ = line; // skip items that error out
+    }
+
+    Ok(())
+}
+
+/// Activates a StatusNotifierItem (the tray "Open"/left-click action).
+async fn tray_activate(bus: &str, path: &str) -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+        .interface("org.kde.StatusNotifierItem")?
+        .destination(bus)?
+        .path(path)?
+        .build()
+        .await?;
+    proxy.call_method("Activate", &(0i32, 0i32)).await?;
+    Ok(())
+}
+
+/// Closes a tray item. For our own minimizer items it triggers SecondaryActivate
+/// (the daemon then closes the real window); for any other app it kills the process.
+async fn tray_close(bus: &str, path: &str, pid: i32) -> Result<()> {
+    if bus.contains("minimizer") {
+        let conn = zbus::Connection::session().await?;
+        let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+            .interface("org.kde.StatusNotifierItem")?
+            .destination(bus)?
+            .path(path)?
+            .build()
+            .await?;
+        proxy.call_method("SecondaryActivate", &(0i32, 0i32)).await?;
+    } else if pid > 0 {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    Ok(())
 }
 
 // --- D-Bus protocol type aliases (shapes are dictated by the dbusmenu / StatusNotifierItem specs) ---
@@ -324,7 +590,7 @@ impl StatusNotifierItem {
 
     #[dbus_interface(property)]
     fn id(&self) -> &str {
-        &self.window_info.class
+        &self.window_info.icon
     }
 
     #[dbus_interface(property)]
@@ -339,7 +605,7 @@ impl StatusNotifierItem {
 
     #[dbus_interface(property)]
     fn icon_name(&self) -> &str {
-        &self.window_info.class
+        &self.window_info.icon
     }
 
     #[dbus_interface(property)]
@@ -395,6 +661,41 @@ impl StatusNotifierItem {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Helper subcommands used by tray.sh so it stays a pure reader:
+    //   resolve <class> <pid>          -> prints "name|icon"
+    //   list-tray                      -> prints "name|icon|bus|path|pid" per tray item
+    //   tray-activate <bus> <path>     -> activates (opens) a tray item
+    //   tray-close <bus> <path> <pid>  -> closes the window (minimizer) or kills the app
+    let raw: Vec<String> = std::env::args().collect();
+    match raw.get(1).map(String::as_str) {
+        Some("resolve") => {
+            let class = raw.get(2).map(String::as_str).unwrap_or("");
+            let pid = raw.get(3).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            if let Some((name, icon)) = resolve_entry(class, pid) {
+                println!("{}|{}", name, icon);
+            }
+            return Ok(());
+        }
+        Some("list-tray") => {
+            list_tray().await?;
+            return Ok(());
+        }
+        Some("tray-activate") => {
+            let bus = raw.get(2).map(String::as_str).unwrap_or("");
+            let path = raw.get(3).map(String::as_str).unwrap_or("");
+            tray_activate(bus, path).await?;
+            return Ok(());
+        }
+        Some("tray-close") => {
+            let bus = raw.get(2).map(String::as_str).unwrap_or("");
+            let path = raw.get(3).map(String::as_str).unwrap_or("");
+            let pid = raw.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            tray_close(bus, path, pid).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let args = Args::parse();
 
     // 1. Get window info based on CLI arguments
@@ -415,6 +716,11 @@ async fn main() -> Result<()> {
         // Fallback to title if class is empty, for better icon matching
         window_info.class = window_info.title.clone();
     }
+
+    // Resolve a real freedesktop icon name so the tray shows the proper icon.
+    // The raw window class is often useless (e.g. "__main__.py" for python apps).
+    window_info.icon = resolve_icon(&window_info.class, window_info.pid);
+    println!("Resolved icon: {}", window_info.icon);
 
     // 2. Move the window to the special "minimized" workspace
     move_to_workspace("special:minimized", &window_info.address, true)?;
