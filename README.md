@@ -1,17 +1,126 @@
-# Hyprland minimizer
+# hyprland-minimizer
 
-This is a little tool that minimizes the currently focused window in Hyprland to the tray. The minimized application gets shown in the waybar tray. The icon title is the current window class or title, if the class is empty, so you might just have to adjust your waybar config to show the appropriate icon. I use it to keep my messenger and mail apps and corporate things in the background, so I still receive notifications. 
+Minimize windows to the system tray on Hyprland, with **real icon resolution** and
+helper commands to drive a rofi-based tray menu.
 
-Minimizing is done by moving the respective window to a special workspace "minimized". It uses the DBus to notify waybar of these apps and provide a menu to close or restore the app, but don't ask me, how; it handles waybar restarts.
+Send a window out of the way to a hidden workspace and get a clickable tray icon
+(via D-Bus StatusNotifierItem) to bring it back — handy for keeping messengers,
+mail or background apps alive while still receiving notifications.
 
-Do with this thatever you want, I don't care, It's vibe coded. Honestly, I don't even know what the code actually does or how it works, and I don't want to, as long as it does what it does.
+## Key Features
 
-## Installation
+- **Minimize to tray** — moves the focused window (or one given by address) to the
+  `special:minimized` workspace and publishes a StatusNotifierItem tray icon for it.
+- **Real icon resolution** — figures out the proper freedesktop icon by scanning
+  `.desktop` files, with a `/proc/<pid>/cmdline` fallback. Apps that report a useless
+  window class still get the right icon — e.g. themix runs as `python3 -m oomox_gui`
+  and reports class `__main__.py`, yet resolves to `com.github.themix_project.Oomox`.
+  **No icon cache or pacman hooks required.**
+- **Clickable tray icon** — left-click restores, middle-click closes, right-click opens
+  a context menu.
+- **Restore where you want** — bring the window back to your current workspace, or back
+  to the original workspace it was minimized from.
+- **Survives bar restarts** — re-registers its icon when the StatusNotifierWatcher
+  (e.g. Waybar) restarts.
+- **Self-cleaning** — the per-window daemon exits on its own when the window is restored
+  or closed by other means.
+- **Graceful fallback** — if no tray/watcher is running, the window is put back instead
+  of getting stuck hidden.
+- **rofi-friendly** — `list-tray`, `tray-activate`, `tray-close` and `resolve` keep all
+  the D-Bus and icon logic inside the binary, so a rofi tray menu can be a tiny reader
+  script (no `gdbus` or icon cache in bash).
+- **Lightweight** — one small daemon per minimized window, no config files.
 
-Clone the repo, then
+## Build from source
 
 ```
+git clone https://github.com/Justice-Reaper/hyprland-minimizer
+cd hyprland-minimizer
 cargo build --release
+# optional: put it on your PATH
+sudo cp target/release/hyprland-minimizer /usr/local/bin/
 ```
 
-to get a binary in the target/release/ directory.
+## Usage
+
+```
+hyprland-minimizer [ADDRESS]                      Minimize the active window (or one by address)
+hyprland-minimizer resolve <class> <pid>          Print "name|icon" resolved for a window
+hyprland-minimizer list-tray                      Print "name|icon|bus|path|pid" per tray item
+hyprland-minimizer tray-activate <bus> <path>     Activate (open) a tray item
+hyprland-minimizer tray-close <bus> <path> <pid>  Close a tray item (smart, see below)
+```
+
+Minimize a specific window (get the address from `hyprctl clients`):
+
+```
+hyprland-minimizer 0x12345678
+```
+
+## Hyprland keybind
+
+```
+-- minimize the focused window to the tray
+hl.bind("SUPER + T", hl.dsp.exec_cmd("/usr/local/bin/hyprland-minimizer"))
+```
+
+## Tray icon interactions
+
+| Action       | Result                                                     |
+|--------------|------------------------------------------------------------|
+| Left click   | Restore the window to the current workspace and focus it    |
+| Middle click | Close the window                                            |
+| Right click  | Menu: *Open here* · *Open on original workspace* · *Close*  |
+
+## Icon resolution (`resolve`)
+
+The window class alone is often a poor source for an icon: Electron and
+`python -m <module>` apps report things like `chrome_status_icon_1` or `__main__.py`.
+`hyprland-minimizer` resolves the real icon by
+
+1. matching the class against `.desktop` `StartupWMClass` values and filenames, then
+2. falling back to the process command line (`/proc/<pid>/cmdline`) to recover the real
+   module/binary name.
+
+Run it standalone to see what a window would resolve to:
+
+```
+$ hyprland-minimizer resolve __main__.py 22343
+Themix/Oomox theme designer|com.github.themix_project.Oomox
+```
+
+## rofi tray menu
+
+Because `list-tray`, `tray-activate` and `tray-close` do all the D-Bus work, a rofi tray
+menu becomes a thin reader — no `gdbus` parsing or desktop cache in the shell:
+
+```
+$ hyprland-minimizer list-tray
+Discord|discord|:1.407|/StatusNotifierItem|26956
+qBittorrent|qbittorrent|:1.431|/StatusNotifierItem|29237
+Flameshot|org.flameshot.Flameshot|:1.293|/StatusNotifierItem|8433
+```
+
+`tray-close` is smart: for windows minimized by this tool it closes the actual
+window; for any other tray app it terminates the process.
+
+## How it works
+
+Minimizing moves the window to the `special:minimized` workspace and starts a small
+per-window daemon that publishes a StatusNotifierItem over D-Bus. A StatusNotifier host
+(your bar's tray module, e.g. Waybar) renders the icon; clicking it talks back to the
+daemon, which restores or closes the window. The daemon also watches for the window
+being restored or closed externally and exits on its own.
+
+## Requirements
+
+- **Hyprland 0.55+** (Lua dispatch API)
+- A **StatusNotifier tray host / watcher** (e.g. Waybar's `tray` module)
+- A **D-Bus session bus**
+- **Rust** (to build)
+
+## Acknowledgements
+
+Fork of [hyprland-minimizer](https://github.com/Simon-Martens/hyprland-minimizer),
+extended with self-contained icon resolution and the
+`resolve` / `list-tray` / `tray-activate` / `tray-close` helper commands.
