@@ -30,7 +30,6 @@ struct Workspace {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
 struct WindowInfo {
     address: String,
     workspace: Workspace,
@@ -57,18 +56,46 @@ fn hyprctl<T: for<'de> Deserialize<'de>>(command: &str) -> Result<T> {
         .with_context(|| format!("Failed to parse JSON from hyprctl command: {}", command))
 }
 
-/// Executes a hyprctl dispatch command.
-fn hyprctl_dispatch(command: &str) -> Result<()> {
+/// Executes a Lua expression via `hyprctl eval`.
+/// Hyprland 0.55+ with a Lua config no longer accepts the classic
+/// `hyprctl dispatch <name>` syntax, so all dispatches go through eval.
+fn hyprctl_dispatch(lua: &str) -> Result<()> {
     let status = Command::new("hyprctl")
-        .arg("dispatch")
-        .arg(command)
+        .arg("eval")
+        .arg(lua)
         .status()
-        .with_context(|| format!("Failed to execute hyprctl dispatch: {}", command))?;
+        .with_context(|| format!("Failed to execute hyprctl eval: {}", lua))?;
 
     if !status.success() {
-        anyhow::bail!("hyprctl dispatch command '{}' failed", command);
+        anyhow::bail!("hyprctl eval '{}' failed", lua);
     }
     Ok(())
+}
+
+/// Moves a window (by address) to a workspace.
+/// `silent = true` keeps the current workspace active (old `movetoworkspacesilent`);
+/// `silent = false` switches to the target workspace (old `movetoworkspace`).
+fn move_to_workspace(workspace: &str, address: &str, silent: bool) -> Result<()> {
+    hyprctl_dispatch(&format!(
+        "hl.dispatch(hl.dsp.window.move({{workspace = '{}', follow = {}, window = 'address:{}'}}))",
+        workspace, !silent, address
+    ))
+}
+
+/// Focuses a window by address (old `focuswindow`).
+fn focus_window(address: &str) -> Result<()> {
+    hyprctl_dispatch(&format!(
+        "hl.dispatch(hl.dsp.focus({{window = 'address:{}'}}))",
+        address
+    ))
+}
+
+/// Closes a window by address (old `closewindow`).
+fn close_window(address: &str) -> Result<()> {
+    hyprctl_dispatch(&format!(
+        "hl.dispatch(hl.dsp.window.close({{window = 'address:{}'}}))",
+        address
+    ))
 }
 
 /// Finds a window by its address from the list of all clients.
@@ -80,6 +107,15 @@ fn get_window_by_address(address: &str) -> Result<WindowInfo> {
         .find(|c| c.address == address)
         .ok_or_else(|| anyhow!("Could not find a window with address '{}'", address))
 }
+
+// --- D-Bus protocol type aliases (shapes are dictated by the dbusmenu / StatusNotifierItem specs) ---
+
+/// A dbusmenu node: (id, properties, children).
+type MenuNode<'a> = (i32, HashMap<String, Value<'a>>, Vec<Value<'a>>);
+/// Properties for a single dbusmenu item: (id, properties).
+type MenuItemProps<'a> = (i32, HashMap<String, Value<'a>>);
+/// StatusNotifierItem tooltip: (icon_name, icon_pixmap, title, description).
+type ToolTip = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 
 // --- D-Bus Menu Implementation ---
 
@@ -96,7 +132,7 @@ impl DbusMenu {
         _parent_id: i32,
         _recursion_depth: i32,
         _property_names: Vec<String>,
-    ) -> (u32, (i32, HashMap<String, Value>, Vec<Value>)) {
+    ) -> (u32, MenuNode<'_>) {
         println!("[D-Bus Menu] GetLayout called.");
 
         // Item ID 1: Open on current workspace
@@ -153,7 +189,7 @@ impl DbusMenu {
         &self,
         ids: Vec<i32>,
         _property_names: Vec<String>,
-    ) -> Vec<(i32, HashMap<String, Value>)> {
+    ) -> Vec<MenuItemProps<'_>> {
         println!("[D-Bus Menu] GetGroupProperties called for IDs: {:?}", ids);
         let mut result = Vec::new();
         for id in ids {
@@ -200,16 +236,12 @@ impl DbusMenu {
                     // Open on current workspace
                     println!("[D-Bus Menu] 'Open' action triggered.");
                     match hyprctl::<Workspace>("activeworkspace") {
-                        Ok(active_workspace) => hyprctl_dispatch(&format!(
-                            "movetoworkspace {},address:{}",
-                            active_workspace.id, self.window_info.address
-                        ))
-                        .and_then(|_| {
-                            hyprctl_dispatch(&format!(
-                                "focuswindow address:{}",
-                                self.window_info.address
-                            ))
-                        }),
+                        Ok(active_workspace) => move_to_workspace(
+                            &active_workspace.id.to_string(),
+                            &self.window_info.address,
+                            false,
+                        )
+                        .and_then(|_| focus_window(&self.window_info.address)),
                         Err(e) => {
                             eprintln!("[Error] Failed to get active workspace: {}", e);
                             Err(e)
@@ -219,21 +251,17 @@ impl DbusMenu {
                 2 => {
                     // Open on original workspace
                     println!("[D-Bus Menu] 'Open on original workspace' action triggered.");
-                    hyprctl_dispatch(&format!(
-                        "movetoworkspace {},address:{}",
-                        self.window_info.workspace.id, self.window_info.address
-                    ))
-                    .and_then(|_| {
-                        hyprctl_dispatch(&format!(
-                            "focuswindow address:{}",
-                            self.window_info.address
-                        ))
-                    })
+                    move_to_workspace(
+                        &self.window_info.workspace.id.to_string(),
+                        &self.window_info.address,
+                        false,
+                    )
+                    .and_then(|_| focus_window(&self.window_info.address))
                 }
                 3 => {
                     // Close the window
                     println!("[D-Bus Menu] 'Close' action triggered.");
-                    hyprctl_dispatch(&format!("closewindow address:{}", self.window_info.address))
+                    close_window(&self.window_info.address)
                 }
                 _ => {
                     println!("[D-Bus Menu] Clicked on unknown item id: {}", id);
@@ -243,7 +271,7 @@ impl DbusMenu {
 
             if let Err(e) = res {
                 eprintln!(
-                    "[Error] Failed to execute hyprctl dispatch from menu: {}",
+                    "[Error] Failed to execute hyprctl eval from menu: {}",
                     e
                 );
             }
@@ -315,7 +343,7 @@ impl StatusNotifierItem {
     }
 
     #[dbus_interface(property)]
-    fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+    fn tool_tip(&self) -> ToolTip {
         (
             String::new(),
             Vec::new(),
@@ -338,13 +366,12 @@ impl StatusNotifierItem {
     fn activate(&self, _x: i32, _y: i32) {
         println!("[D-Bus] Activate called (left-click)");
         if let Ok(active_workspace) = hyprctl::<Workspace>("activeworkspace") {
-            if let Err(e) = hyprctl_dispatch(&format!(
-                "movetoworkspace {},address:{}",
-                active_workspace.id, self.window_info.address
-            ))
-            .and_then(|_| {
-                hyprctl_dispatch(&format!("focuswindow address:{}", self.window_info.address))
-            }) {
+            if let Err(e) = move_to_workspace(
+                &active_workspace.id.to_string(),
+                &self.window_info.address,
+                false,
+            )
+            .and_then(|_| focus_window(&self.window_info.address)) {
                 eprintln!("[Error] Failed to execute activate action: {}", e);
             }
         } else {
@@ -356,7 +383,7 @@ impl StatusNotifierItem {
     fn secondary_activate(&self, _x: i32, _y: i32) {
         println!("[D-Bus] SecondaryActivate called (middle-click to close)");
         if let Err(e) =
-            hyprctl_dispatch(&format!("closewindow address:{}", self.window_info.address))
+            close_window(&self.window_info.address)
         {
             eprintln!("[Error] Failed to execute secondary_activate action: {}", e);
         }
@@ -390,10 +417,7 @@ async fn main() -> Result<()> {
     }
 
     // 2. Move the window to the special "minimized" workspace
-    hyprctl_dispatch(&format!(
-        "movetoworkspacesilent special:minimized,address:{}",
-        window_info.address
-    ))?;
+    move_to_workspace("special:minimized", &window_info.address, true)?;
 
     // 3. Set up the D-Bus services
     let exit_notify = Arc::new(Notify::new());
@@ -427,7 +451,7 @@ async fn main() -> Result<()> {
 
     // 4. Initial registration with the StatusNotifierWatcher
     let initial_registration_result = async {
-        let watcher_proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&*arc_conn)
+        let watcher_proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&arc_conn)
             .interface("org.kde.StatusNotifierWatcher")?
             .path("/StatusNotifierWatcher")?
             .destination("org.kde.StatusNotifierWatcher")?
@@ -443,10 +467,11 @@ async fn main() -> Result<()> {
     if let Err(e) = initial_registration_result {
         eprintln!("Could not register with StatusNotifierWatcher: {}", e);
         eprintln!("Is a tray like Waybar running?");
-        let _ = hyprctl_dispatch(&format!(
-            "movetoworkspace {},address:{}",
-            window_info.workspace.id, window_info.address
-        ));
+        let _ = move_to_workspace(
+            &window_info.workspace.id.to_string(),
+            &window_info.address,
+            false,
+        );
         anyhow::bail!("Failed to register tray icon.");
     }
     println!("Registration successful.");
@@ -455,7 +480,7 @@ async fn main() -> Result<()> {
     let conn_clone_watcher = Arc::clone(&arc_conn);
     let bus_name_clone = bus_name.clone();
     tokio::spawn(async move {
-        let dbus_proxy = match zbus::fdo::DBusProxy::new(&*conn_clone_watcher).await {
+        let dbus_proxy = match zbus::fdo::DBusProxy::new(&conn_clone_watcher).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[Watcher] Failed to connect to D-Bus proxy: {}", e);
@@ -481,7 +506,7 @@ async fn main() -> Result<()> {
                         // Give the watcher a moment to get ready
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         let watcher_proxy: Proxy<'_> =
-                            zbus::ProxyBuilder::new_bare(&*conn_clone_watcher)
+                            zbus::ProxyBuilder::new_bare(&conn_clone_watcher)
                                 .interface("org.kde.StatusNotifierWatcher")?
                                 .path("/StatusNotifierWatcher")?
                                 .destination("org.kde.StatusNotifierWatcher")?
@@ -537,10 +562,11 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\nInterrupted by Ctrl+C. Restoring window.");
-            let _ = hyprctl_dispatch(&format!(
-                "movetoworkspace {},address:{}",
-                window_info.workspace.id, window_info.address
-            ));
+            let _ = move_to_workspace(
+                &window_info.workspace.id.to_string(),
+                &window_info.address,
+                false,
+            );
         }
         _ = exit_notify.notified() => {
             println!("Exit notification received.");
