@@ -374,6 +374,147 @@ async fn tray_close(bus: &str, path: &str, pid: i32) -> Result<()> {
     Ok(())
 }
 
+// --- StatusNotifierWatcher daemon ---
+// Lets hyprland-minimizer be the tray "watcher" itself, so Waybar's tray module is
+// not needed. Apps and our own minimized-window items register here; tray.sh reads
+// the list. IsStatusNotifierHostRegistered is reported true so Qt/Electron apps
+// (Discord, qBittorrent, ...) actually publish their icons.
+
+struct Watcher {
+    items: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[dbus_interface(name = "org.kde.StatusNotifierWatcher")]
+impl Watcher {
+    async fn register_status_notifier_item(
+        &self,
+        service: String,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
+        #[zbus(signal_context)] ctxt: zbus::SignalContext<'_>,
+    ) {
+        let sender = header
+            .sender()
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // The argument is either a bus name or an object path (KDE spec).
+        let entry = if service.starts_with('/') {
+            format!("{}{}", sender, service)
+        } else {
+            format!("{}/StatusNotifierItem", service)
+        };
+        {
+            let mut items = self.items.lock().unwrap();
+            if items.contains(&entry) {
+                return;
+            }
+            items.push(entry.clone());
+        }
+        let _ = Watcher::status_notifier_item_registered(&ctxt, &entry).await;
+    }
+
+    async fn register_status_notifier_host(
+        &self,
+        _service: String,
+        #[zbus(signal_context)] ctxt: zbus::SignalContext<'_>,
+    ) {
+        let _ = Watcher::status_notifier_host_registered(&ctxt).await;
+    }
+
+    #[dbus_interface(property)]
+    fn registered_status_notifier_items(&self) -> Vec<String> {
+        self.items.lock().unwrap().clone()
+    }
+
+    #[dbus_interface(property)]
+    fn is_status_notifier_host_registered(&self) -> bool {
+        true
+    }
+
+    #[dbus_interface(property)]
+    fn protocol_version(&self) -> i32 {
+        0
+    }
+
+    #[dbus_interface(signal)]
+    async fn status_notifier_item_registered(
+        ctxt: &zbus::SignalContext<'_>,
+        service: &str,
+    ) -> zbus::Result<()>;
+
+    #[dbus_interface(signal)]
+    async fn status_notifier_item_unregistered(
+        ctxt: &zbus::SignalContext<'_>,
+        service: &str,
+    ) -> zbus::Result<()>;
+
+    #[dbus_interface(signal)]
+    async fn status_notifier_host_registered(ctxt: &zbus::SignalContext<'_>) -> zbus::Result<()>;
+
+    #[dbus_interface(signal)]
+    async fn status_notifier_host_unregistered(
+        ctxt: &zbus::SignalContext<'_>,
+    ) -> zbus::Result<()>;
+}
+
+/// Runs a StatusNotifierWatcher daemon — a drop-in replacement for Waybar's tray
+/// module. Owns org.kde.StatusNotifierWatcher and tracks registered items.
+async fn watch() -> Result<()> {
+    let items = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let watcher = Watcher {
+        items: items.clone(),
+    };
+
+    let conn = ConnectionBuilder::session()?
+        .name("org.kde.StatusNotifierWatcher")?
+        .serve_at("/StatusNotifierWatcher", watcher)?
+        .build()
+        .await
+        .context(
+            "Could not own org.kde.StatusNotifierWatcher \
+             (is another tray/watcher running, e.g. Waybar's tray module?)",
+        )?;
+
+    println!("StatusNotifierWatcher running.");
+
+    // Drop items whose owning process disappears from the bus.
+    let ctxt = zbus::SignalContext::new(&conn, "/StatusNotifierWatcher")?;
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+    let mut changes = dbus.receive_name_owner_changed().await?;
+
+    while let Some(signal) = changes.next().await {
+        let args = match signal.args() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if args.new_owner().is_some() {
+            continue; // name acquired, not lost
+        }
+        let gone = args.name().to_string();
+
+        let mut removed = Vec::new();
+        {
+            let mut list = items.lock().unwrap();
+            list.retain(|entry| {
+                let bus = entry.split('/').next().unwrap_or("");
+                if bus == gone {
+                    removed.push(entry.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for entry in removed {
+            let _ = Watcher::status_notifier_item_unregistered(&ctxt, &entry).await;
+        }
+    }
+
+    Ok(())
+}
+
 // --- D-Bus protocol type aliases (shapes are dictated by the dbusmenu / StatusNotifierItem specs) ---
 
 /// A dbusmenu node: (id, properties, children).
@@ -691,6 +832,10 @@ async fn main() -> Result<()> {
             let path = raw.get(3).map(String::as_str).unwrap_or("");
             let pid = raw.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             tray_close(bus, path, pid).await?;
+            return Ok(());
+        }
+        Some("watch") => {
+            watch().await?;
             return Ok(());
         }
         _ => {}
