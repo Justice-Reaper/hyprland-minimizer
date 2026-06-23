@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration};
-use zbus::zvariant::{ObjectPath, Value};
+use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 use zbus::{dbus_interface, ConnectionBuilder, Proxy};
 
 // --- Command-Line Interface Definition ---
@@ -343,34 +343,118 @@ async fn list_tray() -> Result<()> {
     Ok(())
 }
 
-/// Activates a StatusNotifierItem (the tray "Open"/left-click action).
-async fn tray_activate(bus: &str, path: &str) -> Result<()> {
-    let conn = zbus::Connection::session().await?;
-    let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+// --- Native context menu reading (com.canonical.dbusmenu) ---
+// Lets tray.sh show each item's *own* menu in rofi, one level at a time, exactly
+// like a real tray (right-click in Windows/Plasma). Works for both our minimizer
+// items (which serve their own Open/Close menu) and native apps (Discord & co.),
+// so the same path handles everything.
+
+/// A dbusmenu node from GetLayout: (id, properties, children-as-variants).
+type MenuLayoutNode = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+/// Reads the dbusmenu object path a StatusNotifierItem points at (its Menu property).
+async fn menu_object_path(conn: &zbus::Connection, bus: &str, path: &str) -> Result<String> {
+    let sni: Proxy<'_> = zbus::ProxyBuilder::new_bare(conn)
         .interface("org.kde.StatusNotifierItem")?
         .destination(bus)?
         .path(path)?
         .build()
         .await?;
-    proxy.call_method("Activate", &(0i32, 0i32)).await?;
+    let menu: zbus::zvariant::OwnedObjectPath = sni.get_property("Menu").await?;
+    Ok(menu.into_inner().to_string())
+}
+
+fn prop_string(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    props.get(key).and_then(|v| String::try_from(v.clone()).ok())
+}
+
+fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str, default: bool) -> bool {
+    props
+        .get(key)
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(default)
+}
+
+/// Strips GTK ('_') and Qt ('&') mnemonic markers from a menu label.
+fn strip_mnemonics(label: &str) -> String {
+    label
+        .replace("&&", "\u{1}")
+        .replace('&', "")
+        .replace('\u{1}', "&")
+        .replace('_', "")
+}
+
+/// Prints the immediate children of `parent_id` (0 = root), one per line, as
+/// `label<US>id<US>kind` where <US> is the ASCII Unit Separator (0x1F) so a literal
+/// separator can never appear inside a label. kind is "submenu" (navigate into it)
+/// or "item" (clickable). Separators, hidden and disabled entries are filtered out.
+async fn tray_menu(bus: &str, path: &str, parent_id: i32) -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let mpath = menu_object_path(&conn, bus, path).await?;
+    if mpath == "/" {
+        return Ok(()); // item exposes no menu
+    }
+
+    let menu: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+        .interface("com.canonical.dbusmenu")?
+        .destination(bus)?
+        .path(mpath.as_str())?
+        .build()
+        .await?;
+
+    // Some apps populate a submenu lazily on AboutToShow; ignore failures.
+    let _ = menu.call_method("AboutToShow", &(parent_id,)).await;
+
+    // depth 1 -> the parent node plus its immediate children
+    let reply = menu
+        .call_method("GetLayout", &(parent_id, 1i32, Vec::<String>::new()))
+        .await?;
+    let (_revision, root): (u32, MenuLayoutNode) = reply.body()?;
+    let (_id, _props, children) = root;
+
+    for child in children {
+        let (cid, cprops, _) = match MenuLayoutNode::try_from(child) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if prop_string(&cprops, "type").as_deref() == Some("separator") {
+            continue;
+        }
+        if !prop_bool(&cprops, "visible", true) || !prop_bool(&cprops, "enabled", true) {
+            continue;
+        }
+        let label = match prop_string(&cprops, "label") {
+            Some(l) => strip_mnemonics(&l),
+            None => continue,
+        };
+        if label.trim().is_empty() {
+            continue;
+        }
+        let kind = if prop_string(&cprops, "children-display").as_deref() == Some("submenu") {
+            "submenu"
+        } else {
+            "item"
+        };
+        println!("{}\u{1f}{}\u{1f}{}", label, cid, kind);
+    }
     Ok(())
 }
 
-/// Closes a tray item. For our own minimizer items it triggers SecondaryActivate
-/// (the daemon then closes the real window); for any other app it kills the process.
-async fn tray_close(bus: &str, path: &str, pid: i32) -> Result<()> {
-    if bus.contains("minimizer") {
-        let conn = zbus::Connection::session().await?;
-        let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
-            .interface("org.kde.StatusNotifierItem")?
-            .destination(bus)?
-            .path(path)?
-            .build()
-            .await?;
-        proxy.call_method("SecondaryActivate", &(0i32, 0i32)).await?;
-    } else if pid > 0 {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+/// Triggers a menu entry by id (the app then runs that action itself).
+async fn tray_menu_click(bus: &str, path: &str, id: i32) -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let mpath = menu_object_path(&conn, bus, path).await?;
+    if mpath == "/" {
+        return Ok(());
     }
+    let menu: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
+        .interface("com.canonical.dbusmenu")?
+        .destination(bus)?
+        .path(mpath.as_str())?
+        .build()
+        .await?;
+    menu.call_method("Event", &(id, "clicked", Value::from(""), 0u32))
+        .await?;
     Ok(())
 }
 
@@ -805,8 +889,8 @@ async fn main() -> Result<()> {
     // Helper subcommands used by tray.sh so it stays a pure reader:
     //   resolve <class> <pid>          -> prints "name|icon"
     //   list-tray                      -> prints "name|icon|bus|path|pid" per tray item
-    //   tray-activate <bus> <path>     -> activates (opens) a tray item
-    //   tray-close <bus> <path> <pid>  -> closes the window (minimizer) or kills the app
+    //   tray-menu <bus> <path> [pid]   -> prints the children of <pid> (0=root), one per line
+    //   tray-menu-click <bus> <path> <id> -> triggers the menu entry <id>
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(String::as_str) {
         Some("resolve") => {
@@ -821,17 +905,18 @@ async fn main() -> Result<()> {
             list_tray().await?;
             return Ok(());
         }
-        Some("tray-activate") => {
+        Some("tray-menu") => {
             let bus = raw.get(2).map(String::as_str).unwrap_or("");
             let path = raw.get(3).map(String::as_str).unwrap_or("");
-            tray_activate(bus, path).await?;
+            let parent = raw.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            tray_menu(bus, path, parent).await?;
             return Ok(());
         }
-        Some("tray-close") => {
+        Some("tray-menu-click") => {
             let bus = raw.get(2).map(String::as_str).unwrap_or("");
             let path = raw.get(3).map(String::as_str).unwrap_or("");
-            let pid = raw.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-            tray_close(bus, path, pid).await?;
+            let id = raw.get(4).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            tray_menu_click(bus, path, id).await?;
             return Ok(());
         }
         Some("watch") => {
