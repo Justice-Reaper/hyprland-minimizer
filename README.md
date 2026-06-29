@@ -26,9 +26,12 @@ mail or background apps alive while still receiving notifications.
   or closed by other means.
 - **Graceful fallback** — if no tray/watcher is running, the window is put back instead
   of getting stuck hidden.
-- **rofi-friendly** — `list-tray`, `tray-activate`, `tray-close` and `resolve` keep all
+- **rofi-friendly** — `list-tray`, `tray-menu`, `tray-menu-click` and `resolve` keep all
   the D-Bus and icon logic inside the binary, so a rofi tray menu can be a tiny reader
   script (no `gdbus` or icon cache in bash).
+- **Native per-app menus** — each tray item's own right-click menu (Discord, qBittorrent,
+  ... and the minimizer's own Open/Close) is read straight from `com.canonical.dbusmenu`
+  and walked one level at a time, submenus included — just like a real desktop tray.
 - **Built-in tray watcher** — `hyprland-minimizer watch` runs a standalone
   `org.kde.StatusNotifierWatcher`, so you can drop your bar's tray module entirely and
   still have a fully working tray (apps register here; browse it via rofi).
@@ -47,12 +50,12 @@ sudo cp target/release/hyprland-minimizer /usr/local/bin/
 ## Usage
 
 ```
-hyprland-minimizer [ADDRESS]                      Minimize the active window (or one by address)
-hyprland-minimizer resolve <class> <pid>          Print "name|icon" resolved for a window
-hyprland-minimizer list-tray                      Print "name|icon|bus|path|pid" per tray item
-hyprland-minimizer tray-activate <bus> <path>     Activate (open) a tray item
-hyprland-minimizer tray-close <bus> <path> <pid>  Close a tray item (smart, see below)
-hyprland-minimizer watch                          Run a StatusNotifierWatcher daemon
+hyprland-minimizer [ADDRESS]                          Minimize the active window (or one by address)
+hyprland-minimizer resolve <class> <pid>              Print "name|icon" resolved for a window
+hyprland-minimizer list-tray                          Print "name|icon|bus|path|pid" per tray item
+hyprland-minimizer tray-menu <bus> <path> [parent]    Print a tray item's menu entries (children of parent, 0=root)
+hyprland-minimizer tray-menu-click <bus> <path> <id>  Trigger the menu entry <id>
+hyprland-minimizer watch                              Run a StatusNotifierWatcher daemon
 ```
 
 Minimize a specific window (get the address from `hyprctl clients`):
@@ -74,7 +77,7 @@ hl.bind("SUPER + T", hl.dsp.exec_cmd("/usr/local/bin/hyprland-minimizer"))
 |--------------|------------------------------------------------------------|
 | Left click   | Restore the window to the current workspace and focus it    |
 | Middle click | Close the window                                            |
-| Right click  | Menu: *Open here* · *Open on original workspace* · *Close*  |
+| Right click  | Menu: *Open* · *Open on original workspace* · *Close* (labels include the window title and workspace id) |
 
 ## Icon resolution (`resolve`)
 
@@ -95,8 +98,10 @@ Themix/Oomox theme designer|com.github.themix_project.Oomox
 
 ## rofi tray menu
 
-Because `list-tray`, `tray-activate` and `tray-close` do all the D-Bus work, a rofi tray
-menu becomes a thin reader — no `gdbus` parsing or desktop cache in the shell:
+Because `list-tray`, `tray-menu` and `tray-menu-click` do all the D-Bus work, a rofi tray
+menu becomes a thin reader — no `gdbus` parsing or desktop cache in the shell.
+
+First, list the tray items:
 
 ```
 $ hyprland-minimizer list-tray
@@ -105,8 +110,24 @@ qBittorrent|qbittorrent|:1.431|/StatusNotifierItem|29237
 Flameshot|org.flameshot.Flameshot|:1.293|/StatusNotifierItem|8433
 ```
 
-`tray-close` is smart: for windows minimized by this tool it closes the actual
-window; for any other tray app it terminates the process.
+Then read the chosen item's own menu with `tray-menu <bus> <path> [parent]` (`parent` is
+the entry id to descend into, `0` or omitted = root). Each line is `label`, `id` and
+`kind` separated by the ASCII Unit Separator (`0x1f`), where `kind` is `submenu` (descend
+with another `tray-menu` call) or `item` (clickable). Separators, hidden and disabled
+entries are filtered out, so the reader just renders what it gets:
+
+```
+$ hyprland-minimizer tray-menu :1.407 /StatusNotifierItem 0
+Mute<US>12<US>item
+Deafen<US>14<US>item
+Settings<US>20<US>submenu
+Quit<US>30<US>item
+```
+
+Finally, trigger the selected entry with `tray-menu-click <bus> <path> <id>` and the app
+runs that action itself. This walks each item's native menu one level at a time —
+including the minimizer's own *Open* / *Open on original workspace* / *Close* entries —
+exactly like a real desktop tray.
 
 ## Standalone tray watcher (no bar tray module)
 
@@ -144,4 +165,4 @@ being restored or closed externally and exits on its own.
 
 Fork of [hyprland-minimizer](https://github.com/Simon-Martens/hyprland-minimizer),
 extended with self-contained icon resolution and the
-`resolve` / `list-tray` / `tray-activate` / `tray-close` helper commands.
+`resolve` / `list-tray` / `tray-menu` / `tray-menu-click` helper commands.

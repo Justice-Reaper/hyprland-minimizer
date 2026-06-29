@@ -278,8 +278,6 @@ fn resolve_icon(class: &str, pid: i32) -> String {
 }
 
 // --- System tray reading (for the rofi tray menu) ---
-// These let tray.sh be a pure reader: it calls `list-tray` to get the entries and
-// `tray-activate` to open one, instead of doing the D-Bus dance in bash.
 
 /// Uppercases the first character (mirrors bash `${var^}`).
 fn capitalize(s: &str) -> String {
