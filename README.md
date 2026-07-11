@@ -64,8 +64,3 @@ icon read from each item's own SNI (icon = its name mapped to a `.desktop` `Icon
 
 Hyprland 0.55+ · a StatusNotifier watcher (your bar's tray, or `hyprland-minimizer watch`)
 · a D-Bus session bus
-
-## Acknowledgements
-
-Fork of [Simon-Martens/hyprland-minimizer](https://github.com/Simon-Martens/hyprland-minimizer)
-with self-contained icon resolution and the rofi helper commands
