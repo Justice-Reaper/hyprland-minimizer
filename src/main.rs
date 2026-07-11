@@ -1,5 +1,6 @@
-//! Main application logic for the minimize-to-tray utility.
-//! Place this file in the `src/` directory of your Rust project.
+//! Minimize-to-tray utility for Hyprland: hides a window to a special workspace
+//! and publishes a StatusNotifierItem for it, plus helper subcommands that let a
+//! rofi script drive the tray (list items, read menus, resolve icons).
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -42,6 +43,12 @@ struct WindowInfo {
     /// hyprctl); falls back to `class` when nothing matches.
     #[serde(default)]
     icon: String,
+    /// Resolved app display name (the desktop entry's Name). Filled in like
+    /// `icon`; falls back to the capitalized class. This is what our tray item
+    /// advertises as its label, so it reads "Vesktop" instead of the raw window
+    /// title.
+    #[serde(default)]
+    app_name: String,
 }
 
 // --- Hyprland Interaction Functions ---
@@ -131,7 +138,7 @@ fn alnum_prefix(s: &str) -> &str {
 }
 
 /// Scans .desktop files into a sorted list of (key, name, icon) tuples. Keys are
-/// the lowercased StartupWMClass and the lowercased file stem (mirrors desktop-cache.sh).
+/// the lowercased StartupWMClass and the lowercased file stem.
 fn desktop_entries() -> Vec<(String, String, String)> {
     let mut dirs = vec!["/usr/share/applications".to_string()];
     if let Ok(home) = std::env::var("HOME") {
@@ -174,11 +181,15 @@ fn desktop_entries() -> Vec<(String, String, String)> {
                     }
                 }
             }
+            // Trim so a stray leading/trailing space in a value can't break an
+            // exact Name match or a theme icon lookup.
+            let name = name.trim();
             if name.is_empty() {
                 continue;
             }
             let name = name.to_string();
-            let icon = icon.to_string();
+            let icon = icon.trim().to_string();
+            let wmclass = wmclass.trim();
             if !wmclass.is_empty() {
                 entries.push((wmclass.to_lowercase(), name.clone(), icon.clone()));
             }
@@ -270,11 +281,27 @@ fn resolve_entry(class: &str, pid: i32) -> Option<(String, String)> {
     None
 }
 
-/// Resolves just the icon name for a window, falling back to `class` if nothing matches.
-fn resolve_icon(class: &str, pid: i32) -> String {
-    resolve_entry(class, pid)
-        .map(|(_, icon)| icon)
-        .unwrap_or_else(|| class.to_string())
+/// Resolves (name, icon) for a window, falling back to (capitalized class, class)
+/// when no desktop entry matches.
+fn resolve_name_icon(class: &str, pid: i32) -> (String, String) {
+    resolve_entry(class, pid).unwrap_or_else(|| (capitalize(class), class.to_string()))
+}
+
+/// Maps a human app name (e.g. a tray item's advertised "Discord"/"Vesktop") to a
+/// themed icon by matching the `Name=` field of the installed .desktop entries
+/// (passed in so the caller scans the database once for the whole tray). Pure
+/// lookup on data the app hands us — no process inspection — so a tray icon that
+/// only ships a generic Id can still get the proper themed icon. None if nothing
+/// matches.
+fn icon_for_app_name(entries: &[(String, String, String)], app_name: &str) -> Option<String> {
+    let q = app_name.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|(_, name, icon)| name.to_lowercase() == q && !icon.is_empty())
+        .map(|(_, _, icon)| icon.clone())
 }
 
 // --- System tray reading (for the rofi tray menu) ---
@@ -288,8 +315,22 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Prints every registered StatusNotifierItem as `name|icon|bus|path|pid`.
-async fn list_tray() -> Result<()> {
+/// Prints every registered StatusNotifierItem as `name<US>icon<US>bus<US>path<US>pid`
+/// (fields joined by the ASCII Unit Separator, 0x1F).
+///
+/// `filter` picks which items to print: "mine"/"minimized" = the windows we
+/// minimized (their bus name is our `…minimizer.pN`), "native"/"others" = real
+/// app trays, anything else = all of them.
+///
+/// Everything is driven by the item's own SNI properties, so our minimized
+/// windows and native app trays go through the same path (no /proc, no window
+/// class guessing):
+///   name  = ToolTip title -> Title -> capitalized Id
+///   icon  = name mapped to a .desktop Icon -> application-x-addon
+/// The themed .desktop icon keeps the tray consistent with the theme; the
+/// fallback is an explicit generic icon that exists in the theme (rofi won't
+/// apply its own fallback-icon to an unresolved explicit dmenu icon).
+async fn list_tray(filter: &str) -> Result<()> {
     let conn = zbus::Connection::session().await?;
 
     let watcher: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
@@ -306,13 +347,30 @@ async fn list_tray() -> Result<()> {
 
     let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
 
+    // Scan the .desktop database once for the whole tray, not once per item.
+    let entries = desktop_entries();
+
     for item in items {
         let (bus, path) = match item.split_once('/') {
             Some((b, p)) => (b.to_string(), format!("/{}", p)),
             None => (item.clone(), "/StatusNotifierItem".to_string()),
         };
 
-        let line: Result<()> = async {
+        // Our own minimized-window items own a `…minimizer.pN` bus name; native
+        // app trays don't. Let the caller list one group or the other.
+        let is_mine = bus.starts_with("org.kde.StatusNotifierItem.minimizer.");
+        let keep = match filter {
+            "mine" | "minimized" => is_mine,
+            "native" | "others" => !is_mine,
+            _ => true,
+        };
+        if !keep {
+            continue;
+        }
+
+        // Read each item under a deadline so one frozen tray app (alive but not
+        // answering D-Bus) can't hang the whole list.
+        let line = tokio::time::timeout(Duration::from_millis(500), async {
             let proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&conn)
                 .interface("org.kde.StatusNotifierItem")?
                 .destination(bus.as_str())?
@@ -321,21 +379,40 @@ async fn list_tray() -> Result<()> {
                 .await?;
 
             let id: String = proxy.get_property("Id").await.unwrap_or_default();
+            let title: String = proxy.get_property("Title").await.unwrap_or_default();
+            let tooltip: ToolTip = proxy.get_property("ToolTip").await.unwrap_or_default();
 
             let pid = match zbus::names::BusName::try_from(bus.as_str()) {
                 Ok(bn) => dbus.get_connection_unix_process_id(bn).await.unwrap_or(0) as i32,
                 Err(_) => 0,
             };
 
-            let (name, icon) = resolve_entry(&id, pid)
-                .unwrap_or_else(|| (capitalize(&id), id.to_lowercase()));
+            // name: the tooltip heading (apps put a clean app name here, e.g.
+            // "Flameshot"/"Vesktop"), then the Title property, then the Id.
+            let name = if !tooltip.2.trim().is_empty() {
+                tooltip.2
+            } else if !title.trim().is_empty() {
+                title
+            } else {
+                capitalize(&id)
+            };
 
-            println!("{}|{}|{}|{}|{}", name, icon, bus, path, pid);
-            Ok(())
-        }
+            // icon: match the name the item advertises against a .desktop `Name=`
+            // (so it gets the themed app icon that matches the rest of the theme),
+            // else a generic icon. rofi does NOT apply its `fallback-icon` to an
+            // unresolved explicit dmenu icon, so the fallback names one that exists
+            // in the theme.
+            let icon = icon_for_app_name(&entries, &name)
+                .unwrap_or_else(|| "application-x-addon".to_string());
+
+            // Fields are separated by the ASCII Unit Separator (0x1F), never '|',
+            // because a name (a window Title / tooltip) can contain any character.
+            println!("{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}", name, icon, bus, path, pid);
+            Ok::<(), anyhow::Error>(())
+        })
         .await;
 
-        let _ = line; // skip items that error out
+        let _ = line; // skip items that error out or don't respond in time
     }
 
     Ok(())
@@ -375,11 +452,16 @@ fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str, default: bool) -> b
 
 /// Strips GTK ('_') and Qt ('&') mnemonic markers from a menu label.
 fn strip_mnemonics(label: &str) -> String {
+    // Use \u{1} as a sentinel for the doubled (literal) marker while the single
+    // marker is stripped, then restore it. \u{1} never appears in a real label,
+    // and it is fully consumed before being reused for the next marker.
     label
         .replace("&&", "\u{1}")
         .replace('&', "")
         .replace('\u{1}', "&")
+        .replace("__", "\u{1}")
         .replace('_', "")
+        .replace('\u{1}', "_")
 }
 
 /// Prints the immediate children of `parent_id` (0 = root), one per line, as
@@ -622,8 +704,6 @@ impl DbusMenu {
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> (u32, MenuNode<'_>) {
-        println!("[D-Bus Menu] GetLayout called.");
-
         // Item ID 1: Open on current workspace
         let mut open_props = HashMap::new();
         open_props.insert("type".to_string(), Value::from("standard"));
@@ -654,7 +734,6 @@ impl DbusMenu {
         );
         let close_item = Value::from((3i32, close_props, Vec::<Value>::new()));
 
-        // The root of the menu layout
         let mut root_props = HashMap::new();
         root_props.insert("children-display".to_string(), Value::from("submenu"));
 
@@ -664,12 +743,7 @@ impl DbusMenu {
             vec![open_item, last_ws_item, close_item],
         );
 
-        // Incrementing the revision number helps ensure clients fetch the new layout
         let revision = 2u32;
-        println!(
-            "[D-Bus Menu] Serving layout revision {}: {:?}",
-            revision, root_layout
-        );
         (revision, root_layout)
     }
 
@@ -679,7 +753,6 @@ impl DbusMenu {
         ids: Vec<i32>,
         _property_names: Vec<String>,
     ) -> Vec<MenuItemProps<'_>> {
-        println!("[D-Bus Menu] GetGroupProperties called for IDs: {:?}", ids);
         let mut result = Vec::new();
         for id in ids {
             let mut props = HashMap::new();
@@ -698,16 +771,11 @@ impl DbusMenu {
             props.insert("type".to_string(), Value::from("standard"));
             result.push((id, props));
         }
-        println!("[D-Bus Menu] Returning properties: {:?}", result);
         result
     }
 
     /// Handles a batch of click events. This is called by Waybar instead of the singular `Event`.
     fn event_group(&self, events: Vec<(i32, String, Value<'_>, u32)>) {
-        println!(
-            "[D-Bus Menu] EventGroup received with {} events",
-            events.len()
-        );
         for (id, event_id, data, timestamp) in events {
             self.event(id, &event_id, data, timestamp);
         }
@@ -715,15 +783,9 @@ impl DbusMenu {
 
     /// Handles a single click event on a menu item.
     fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
-        println!(
-            "[D-Bus Menu] Event received: id='{}', event_id='{}'",
-            id, event_id
-        );
         if event_id == "clicked" {
             let res = match id {
                 1 => {
-                    // Open on current workspace
-                    println!("[D-Bus Menu] 'Open' action triggered.");
                     match hyprctl::<Workspace>("activeworkspace") {
                         Ok(active_workspace) => move_to_workspace(
                             &active_workspace.id.to_string(),
@@ -738,8 +800,6 @@ impl DbusMenu {
                     }
                 }
                 2 => {
-                    // Open on original workspace
-                    println!("[D-Bus Menu] 'Open on original workspace' action triggered.");
                     move_to_workspace(
                         &self.window_info.workspace.id.to_string(),
                         &self.window_info.address,
@@ -748,12 +808,9 @@ impl DbusMenu {
                     .and_then(|_| focus_window(&self.window_info.address))
                 }
                 3 => {
-                    // Close the window
-                    println!("[D-Bus Menu] 'Close' action triggered.");
                     close_window(&self.window_info.address)
                 }
                 _ => {
-                    println!("[D-Bus Menu] Clicked on unknown item id: {}", id);
                     return;
                 }
             };
@@ -770,8 +827,7 @@ impl DbusMenu {
     }
 
     /// Handles a batch of "about to show" requests.
-    fn about_to_show_group(&self, ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
-        println!("[D-Bus Menu] AboutToShowGroup received for IDs: {:?}", ids);
+    fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
         (vec![], vec![])
     }
 
@@ -816,9 +872,13 @@ impl StatusNotifierItem {
         &self.window_info.icon
     }
 
+    // Intentional: the SNI `Title` is the app label, which we set to the resolved
+    // app name (so the tray reads "Vesktop", not the raw window title, which lives
+    // in the tooltip body). Not a misnamed getter.
+    #[allow(clippy::misnamed_getters)]
     #[dbus_interface(property)]
     fn title(&self) -> &str {
-        &self.window_info.title
+        &self.window_info.app_name
     }
 
     #[dbus_interface(property)]
@@ -836,8 +896,8 @@ impl StatusNotifierItem {
         (
             String::new(),
             Vec::new(),
-            self.window_info.title.clone(),
-            String::new(),
+            self.window_info.app_name.clone(), // heading: the app name ("Vesktop")
+            self.window_info.title.clone(),    // body: the window title
         )
     }
 
@@ -853,7 +913,6 @@ impl StatusNotifierItem {
 
     // --- Methods ---
     fn activate(&self, _x: i32, _y: i32) {
-        println!("[D-Bus] Activate called (left-click)");
         if let Ok(active_workspace) = hyprctl::<Workspace>("activeworkspace") {
             if let Err(e) = move_to_workspace(
                 &active_workspace.id.to_string(),
@@ -870,7 +929,6 @@ impl StatusNotifierItem {
     }
 
     fn secondary_activate(&self, _x: i32, _y: i32) {
-        println!("[D-Bus] SecondaryActivate called (middle-click to close)");
         if let Err(e) =
             close_window(&self.window_info.address)
         {
@@ -886,7 +944,7 @@ impl StatusNotifierItem {
 async fn main() -> Result<()> {
     // Helper subcommands used by tray.sh so it stays a pure reader:
     //   resolve <class> <pid>          -> prints "name|icon"
-    //   list-tray                      -> prints "name|icon|bus|path|pid" per tray item
+    //   list-tray [mine|native]        -> prints "name<US>icon<US>bus<US>path<US>pid" (0x1F); filter to our items / real app trays
     //   tray-menu <bus> <path> [pid]   -> prints the children of <pid> (0=root), one per line
     //   tray-menu-click <bus> <path> <id> -> triggers the menu entry <id>
     let raw: Vec<String> = std::env::args().collect();
@@ -900,7 +958,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some("list-tray") => {
-            list_tray().await?;
+            let filter = raw.get(2).map(String::as_str).unwrap_or("");
+            list_tray(filter).await?;
             return Ok(());
         }
         Some("tray-menu") => {
@@ -928,10 +987,8 @@ async fn main() -> Result<()> {
 
     // 1. Get window info based on CLI arguments
     let mut window_info = if let Some(address) = args.window_address {
-        println!("Attempting to minimize window with address: {}", address);
         get_window_by_address(&address)?
     } else {
-        println!("No window address provided, minimizing active window.");
         hyprctl("activewindow").context("Failed to get active window. Is a window focused?")?
     };
 
@@ -945,10 +1002,11 @@ async fn main() -> Result<()> {
         window_info.class = window_info.title.clone();
     }
 
-    // Resolve a real freedesktop icon name so the tray shows the proper icon.
-    // The raw window class is often useless (e.g. "__main__.py" for python apps).
-    window_info.icon = resolve_icon(&window_info.class, window_info.pid);
-    println!("Resolved icon: {}", window_info.icon);
+    // Resolve a real freedesktop name + icon so the tray shows a proper label and
+    // icon. The raw window class is often useless (e.g. "__main__.py" for python).
+    let (app_name, icon) = resolve_name_icon(&window_info.class, window_info.pid);
+    window_info.app_name = app_name;
+    window_info.icon = icon;
 
     // 2. Move the window to the special "minimized" workspace
     move_to_workspace("special:minimized", &window_info.address, true)?;
@@ -981,8 +1039,6 @@ async fn main() -> Result<()> {
     // Create an Arc of the connection to share with the watcher task.
     let arc_conn = Arc::new(connection);
 
-    println!("D-Bus service '{}' is running.", bus_name);
-
     // 4. Initial registration with the StatusNotifierWatcher
     let initial_registration_result = async {
         let watcher_proxy: Proxy<'_> = zbus::ProxyBuilder::new_bare(&arc_conn)
@@ -1010,7 +1066,7 @@ async fn main() -> Result<()> {
     }
     println!("Registration successful.");
 
-    // NEW: Task to watch for Waybar restarts and re-register the icon.
+    // Re-register the icon if the StatusNotifierWatcher (e.g. Waybar) restarts.
     let conn_clone_watcher = Arc::clone(&arc_conn);
     let bus_name_clone = bus_name.clone();
     tokio::spawn(async move {
@@ -1030,12 +1086,9 @@ async fn main() -> Result<()> {
             }
         };
 
-        println!("[Watcher] Watching for 'org.kde.StatusNotifierWatcher' restarts...");
-
         while let Some(signal) = owner_changes.next().await {
             if let Ok(args) = signal.args() {
                 if args.name() == "org.kde.StatusNotifierWatcher" && args.new_owner().is_some() {
-                    println!("[Watcher] Tray service detected. Re-registering icon.");
                     let re_register_result = async {
                         // Give the watcher a moment to get ready
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1083,16 +1136,18 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error checking window state: {}", e);
-                    check_task_exit_notify.notify_one();
-                    break;
+                    // A transient hyprctl failure must not kill the daemon: that
+                    // would drop the tray icon and strand the window on the
+                    // special workspace. Restoring here wouldn't work either (if
+                    // hyprctl is down, move_to_workspace fails too), so just log
+                    // and retry on the next tick.
+                    eprintln!("Error checking window state (will retry): {}", e);
                 }
             }
         }
     });
 
     // 6. Wait for a notification to exit
-    println!("Application minimized to tray. Waiting for activation...");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\nInterrupted by Ctrl+C. Restoring window.");
@@ -1102,12 +1157,9 @@ async fn main() -> Result<()> {
                 false,
             );
         }
-        _ = exit_notify.notified() => {
-            println!("Exit notification received.");
-        }
+        _ = exit_notify.notified() => {}
     }
 
     // 7. Cleanup is handled automatically when the connection is dropped.
-    println!("Exiting.");
     Ok(())
 }
