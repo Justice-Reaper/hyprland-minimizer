@@ -315,6 +315,18 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Capitalizes a bare `Id` for display, but leaves an intentional casing alone:
+/// if the second character is already uppercase, the app chose a lowercase-first
+/// name ("qBittorrent") or an all-caps acronym ("GIMP") on purpose, so we don't
+/// touch it. Otherwise the first letter is uppercased ("flameshot" -> "Flameshot").
+/// Only used as the last-resort label when a tray item exposes no ToolTip/Title.
+fn capitalize_id(s: &str) -> String {
+    if s.chars().nth(1).is_some_and(char::is_uppercase) {
+        return s.to_string();
+    }
+    capitalize(s)
+}
+
 /// Prints every registered StatusNotifierItem as `name<US>icon<US>bus<US>path<US>pid`
 /// (fields joined by the ASCII Unit Separator, 0x1F).
 ///
@@ -387,14 +399,23 @@ async fn list_tray(filter: &str) -> Result<()> {
                 Err(_) => 0,
             };
 
-            // name: the tooltip heading (apps put a clean app name here, e.g.
-            // "Flameshot"/"Vesktop"), then the Title property, then the Id.
-            let name = if !tooltip.2.trim().is_empty() {
-                tooltip.2
+            // name: the tooltip heading (apps put a clean, capitalized app name
+            // here, e.g. "Flameshot"/"Vesktop"), then the Title property, then the
+            // Id.
+            //
+            // But some apps (qBittorrent) abuse the tooltip heading for live status
+            // text — "DL speed: 0 B/s\nUP speed: 0 B/s" — and keep the real app name
+            // in Title/Id. A multi-line heading is that status text, not a label:
+            // skip it and fall back to Title (used as-is, so "qBittorrent" keeps its
+            // casing — capitalizing it would give "QBittorrent"). This also stops a
+            // stray '\n' from splitting one item into several rofi rows.
+            let tip = tooltip.2.trim();
+            let name = if !tip.is_empty() && !tip.contains('\n') {
+                tip.to_string()
             } else if !title.trim().is_empty() {
-                title
+                title.trim().to_string()
             } else {
-                capitalize(&id)
+                capitalize_id(&id)
             };
 
             // icon: match the name the item advertises against a .desktop `Name=`
